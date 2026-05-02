@@ -263,6 +263,36 @@ const RATE_LIMIT_META = {
     "Served from local Postgres cache of pre-ingested enforcement data. No upstream agency calls are made at request time.",
 } as const;
 
+/**
+ * Optional error response shape, included as an extra property on every tool's
+ * outputSchema. When the tool encounters an INVALID_INPUT or INTERNAL failure
+ * it still returns a schema-conformant payload with all required fields
+ * populated with safe defaults, plus this `error` field describing the failure.
+ * This keeps us compliant with Context Protocol's strict outputSchema
+ * validation (which is applied to error responses too).
+ */
+const ERROR_SCHEMA = {
+  type: "object",
+  description:
+    "Populated when the tool could not fulfill the request (invalid input, downstream data outage, etc.). Required fields in the main payload will still be present but populated with safe defaults.",
+  properties: {
+    code: {
+      type: "string",
+      enum: ["INVALID_INPUT", "NOT_FOUND", "INTERNAL", "TIMEOUT"],
+      description: "Machine-readable error code.",
+    },
+    message: {
+      type: "string",
+      description: "Human-readable error message.",
+    },
+    field: {
+      type: ["string", "null"],
+      description: "Name of the offending input field, when relevant.",
+    },
+  },
+  required: ["code", "message"],
+} as const;
+
 export const TOOLS = [
   // =========================================================================
   // QUERY MODE — premium answers
@@ -330,6 +360,7 @@ export const TOOLS = [
         },
         entityMatches: ENTITY_MATCH_ARRAY_SCHEMA,
         metadata: METADATA_SCHEMA,
+        error: ERROR_SCHEMA,
       },
       required: ["entity", "riskSummary", "actions", "entityMatches", "metadata"],
     },
@@ -397,6 +428,7 @@ export const TOOLS = [
         },
         entityMatches: ENTITY_MATCH_ARRAY_SCHEMA,
         metadata: METADATA_SCHEMA,
+        error: ERROR_SCHEMA,
       },
       required: ["entity", "riskSummary", "agencyBreakdown", "timeline", "entityMatches", "metadata"],
     },
@@ -477,6 +509,7 @@ export const TOOLS = [
           items: ACTION_ITEM_SCHEMA,
         },
         metadata: METADATA_SCHEMA,
+        error: ERROR_SCHEMA,
       },
       required: ["topic", "totalMatching", "peerSummary", "actions", "metadata"],
     },
@@ -540,6 +573,7 @@ export const TOOLS = [
           items: ACTION_ITEM_SCHEMA,
         },
         metadata: METADATA_SCHEMA,
+        error: ERROR_SCHEMA,
       },
       required: ["total", "actions", "metadata"],
     },
@@ -576,6 +610,7 @@ export const TOOLS = [
             "The normalized action when found. All fields are null / empty when `found` is false. See `found` to distinguish a miss from a data-gap.",
         },
         metadata: METADATA_SCHEMA,
+        error: ERROR_SCHEMA,
       },
       required: ["found", "metadata"],
     },
@@ -609,6 +644,7 @@ export const TOOLS = [
         query: { type: "string" },
         matches: ENTITY_MATCH_ARRAY_SCHEMA,
         metadata: METADATA_SCHEMA,
+        error: ERROR_SCHEMA,
       },
       required: ["query", "matches", "metadata"],
     },
@@ -655,6 +691,7 @@ export const TOOLS = [
           },
         },
         metadata: METADATA_SCHEMA,
+        error: ERROR_SCHEMA,
       },
       required: ["agencies", "metadata"],
     },

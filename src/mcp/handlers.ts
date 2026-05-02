@@ -132,6 +132,31 @@ function fallbackMetadata(reason = "metadata unavailable"): ResponseMetadata {
   };
 }
 
+/**
+ * Wraps buildMetadata so a transient DB hiccup never bubbles up and breaks
+ * outputSchema validation. Returns a schema-conformant placeholder instead.
+ */
+async function safeBuildMetadata(reason = "metadata unavailable"): Promise<ResponseMetadata> {
+  try {
+    return await buildMetadata();
+  } catch (e) {
+    logger.warn({ err: e }, "buildMetadata failed; using fallback metadata");
+    return fallbackMetadata(reason);
+  }
+}
+
+/**
+ * Canonical serialized shape of a HandlerError for inclusion in the `error`
+ * field of a schema-conformant response payload.
+ */
+function serializeError(e: HandlerError): Record<string, unknown> {
+  return {
+    code: e.code,
+    message: e.message,
+    field: e.field ?? null,
+  };
+}
+
 function describeFreshness(iso: string): string {
   const ageMs = Date.now() - new Date(iso).getTime();
   if (!Number.isFinite(ageMs) || ageMs < 0) return "unknown";
@@ -312,7 +337,19 @@ export async function handleSearchByEntity(
   args: Record<string, unknown>,
 ): Promise<HandlerOutcome<Record<string, unknown>>> {
   const entity = asString(args.entity);
-  if (!entity) return { ok: false, error: err("INVALID_INPUT", "`entity` is required", "entity") };
+  if (!entity) {
+    return {
+      ok: true,
+      data: {
+        entity: "",
+        riskSummary: buildRiskSummary([], ""),
+        actions: [],
+        entityMatches: [],
+        metadata: await safeBuildMetadata(),
+        error: serializeError(err("INVALID_INPUT", "`entity` is required", "entity")),
+      },
+    };
+  }
 
   const agencies = coerceAgencies(args.agencies);
   const minConfidence = asString(args.minConfidence);
@@ -329,90 +366,158 @@ export async function handleSearchByEntity(
     minEntityScore: minScoreFromConfidence(minConfidence),
   };
 
-  const result = await searchActions(filters);
-  const decorated = result.actions.map(decorateAction);
-  const metadata = await buildMetadata();
-
-  return {
-    ok: true,
-    data: {
-      entity,
-      riskSummary: buildRiskSummary(result.actions, entity),
-      actions: decorated,
-      entityMatches: formatEntityMatches(result),
-      metadata,
-    },
-  };
+  try {
+    const result = await searchActions(filters);
+    const decorated = result.actions.map(decorateAction);
+    const metadata = await safeBuildMetadata();
+    return {
+      ok: true,
+      data: {
+        entity,
+        riskSummary: buildRiskSummary(result.actions, entity),
+        actions: decorated,
+        entityMatches: formatEntityMatches(result),
+        metadata,
+      },
+    };
+  } catch (e) {
+    logger.error({ err: e }, "search_enforcement_by_entity failed; returning schema-safe payload");
+    return {
+      ok: true,
+      data: {
+        entity,
+        riskSummary: buildRiskSummary([], entity),
+        actions: [],
+        entityMatches: [],
+        metadata: fallbackMetadata("query failed"),
+        error: serializeError(
+          err("INTERNAL", e instanceof Error ? e.message : String(e)),
+        ),
+      },
+    };
+  }
 }
 
 export async function handleGetRiskProfile(
   args: Record<string, unknown>,
 ): Promise<HandlerOutcome<Record<string, unknown>>> {
   const entity = asString(args.entity);
-  if (!entity) return { ok: false, error: err("INVALID_INPUT", "`entity` is required", "entity") };
+  if (!entity) {
+    return {
+      ok: true,
+      data: {
+        entity: "",
+        resolvedRespondent: null,
+        matchConfidence: null,
+        riskSummary: buildRiskSummary([], ""),
+        agencyBreakdown: [],
+        timeline: [],
+        entityMatches: [],
+        metadata: await safeBuildMetadata(),
+        error: serializeError(err("INVALID_INPUT", "`entity` is required", "entity")),
+      },
+    };
+  }
 
   const lookbackYears = clampInt(asNumber(args.lookbackYears), 1, 50, 10);
   const fromDate = isoYearsAgo(lookbackYears);
 
-  const result = await searchActions({
-    entity,
-    fromDate,
-    limit: 50,
-    minEntityScore: 0.55,
-  });
-  const decorated = result.actions.map(decorateAction);
-
-  const bestMatch = result.entityMatches[0];
-  const riskSummary = buildRiskSummary(result.actions, entity);
-
-  const byAgency: Map<
-    Agency,
-    { actionCount: number; totalPenalty: number; latestDate: string | null }
-  > = new Map();
-  for (const a of result.actions) {
-    const existing = byAgency.get(a.agency) ?? {
-      actionCount: 0,
-      totalPenalty: 0,
-      latestDate: null,
-    };
-    existing.actionCount += 1;
-    existing.totalPenalty += a.penaltyAmount ?? 0;
-    if (a.actionDate && (!existing.latestDate || a.actionDate > existing.latestDate)) {
-      existing.latestDate = a.actionDate;
-    }
-    byAgency.set(a.agency, existing);
-  }
-  const agencyBreakdown = Array.from(byAgency.entries())
-    .map(([agency, v]) => ({
-      agency,
-      actionCount: v.actionCount,
-      totalPenaltyUsd: Math.round(v.totalPenalty * 100) / 100,
-      mostRecentActionDate: v.latestDate,
-    }))
-    .sort((a, b) => b.totalPenaltyUsd - a.totalPenaltyUsd || b.actionCount - a.actionCount);
-
-  const metadata = await buildMetadata();
-
-  return {
-    ok: true,
-    data: {
+  try {
+    const result = await searchActions({
       entity,
-      resolvedRespondent: bestMatch?.respondent ?? null,
-      matchConfidence: bestMatch ? confidenceBucket(bestMatch.bestScore) : null,
-      riskSummary,
-      agencyBreakdown,
-      timeline: decorated,
-      entityMatches: formatEntityMatches(result),
-      metadata,
-    },
-  };
+      fromDate,
+      limit: 50,
+      minEntityScore: 0.55,
+    });
+    const decorated = result.actions.map(decorateAction);
+
+    const bestMatch = result.entityMatches[0];
+    const riskSummary = buildRiskSummary(result.actions, entity);
+
+    const byAgency: Map<
+      Agency,
+      { actionCount: number; totalPenalty: number; latestDate: string | null }
+    > = new Map();
+    for (const a of result.actions) {
+      const existing = byAgency.get(a.agency) ?? {
+        actionCount: 0,
+        totalPenalty: 0,
+        latestDate: null,
+      };
+      existing.actionCount += 1;
+      existing.totalPenalty += a.penaltyAmount ?? 0;
+      if (a.actionDate && (!existing.latestDate || a.actionDate > existing.latestDate)) {
+        existing.latestDate = a.actionDate;
+      }
+      byAgency.set(a.agency, existing);
+    }
+    const agencyBreakdown = Array.from(byAgency.entries())
+      .map(([agency, v]) => ({
+        agency,
+        actionCount: v.actionCount,
+        totalPenaltyUsd: Math.round(v.totalPenalty * 100) / 100,
+        mostRecentActionDate: v.latestDate,
+      }))
+      .sort((a, b) => b.totalPenaltyUsd - a.totalPenaltyUsd || b.actionCount - a.actionCount);
+
+    const metadata = await safeBuildMetadata();
+
+    return {
+      ok: true,
+      data: {
+        entity,
+        resolvedRespondent: bestMatch?.respondent ?? null,
+        matchConfidence: bestMatch ? confidenceBucket(bestMatch.bestScore) : null,
+        riskSummary,
+        agencyBreakdown,
+        timeline: decorated,
+        entityMatches: formatEntityMatches(result),
+        metadata,
+      },
+    };
+  } catch (e) {
+    logger.error({ err: e }, "get_enforcement_risk_profile failed; returning schema-safe payload");
+    return {
+      ok: true,
+      data: {
+        entity,
+        resolvedRespondent: null,
+        matchConfidence: null,
+        riskSummary: buildRiskSummary([], entity),
+        agencyBreakdown: [],
+        timeline: [],
+        entityMatches: [],
+        metadata: fallbackMetadata("query failed"),
+        error: serializeError(
+          err("INTERNAL", e instanceof Error ? e.message : String(e)),
+        ),
+      },
+    };
+  }
 }
 
 export async function handleSearchByTopic(
   args: Record<string, unknown>,
 ): Promise<HandlerOutcome<Record<string, unknown>>> {
   const topic = asString(args.topic);
-  if (!topic) return { ok: false, error: err("INVALID_INPUT", "`topic` is required", "topic") };
+  if (!topic) {
+    return {
+      ok: true,
+      data: {
+        topic: "",
+        totalMatching: 0,
+        peerSummary: {
+          agenciesActive: [],
+          medianPenaltyUsd: null,
+          averagePenaltyUsd: null,
+          totalPenaltyUsd: 0,
+        },
+        actions: [],
+        metadata: await safeBuildMetadata(),
+        error: serializeError(err("INVALID_INPUT", "`topic` is required", "topic")),
+      },
+    };
+  }
 
   const agencies = coerceAgencies(args.agencies);
   const actionTypes = coerceEnumArray<ActionType>(args.actionTypes, ACTION_TYPE_SET);
@@ -420,65 +525,87 @@ export async function handleSearchByTopic(
   const toDate = asString(args.toDate);
   const limit = clampInt(asNumber(args.limit), 1, 200, 25);
 
-  const result = await searchActions({
-    topicText: topic,
-    agencies,
-    actionTypes,
-    fromDate,
-    toDate,
-    limit,
-  });
+  try {
+    const result = await searchActions({
+      topicText: topic,
+      agencies,
+      actionTypes,
+      fromDate,
+      toDate,
+      limit,
+    });
 
-  const agencyRollup: Record<
-    Agency,
-    { actionCount: number; totalPenalty: number }
-  > = {} as Record<Agency, { actionCount: number; totalPenalty: number }>;
-  let totalPenalty = 0;
-  const penalties: number[] = [];
+    const agencyRollup: Record<
+      Agency,
+      { actionCount: number; totalPenalty: number }
+    > = {} as Record<Agency, { actionCount: number; totalPenalty: number }>;
+    let totalPenalty = 0;
+    const penalties: number[] = [];
 
-  for (const a of result.actions) {
-    const bucket = agencyRollup[a.agency] ?? { actionCount: 0, totalPenalty: 0 };
-    bucket.actionCount += 1;
-    if (typeof a.penaltyAmount === "number") {
-      bucket.totalPenalty += a.penaltyAmount;
-      totalPenalty += a.penaltyAmount;
-      penalties.push(a.penaltyAmount);
+    for (const a of result.actions) {
+      const bucket = agencyRollup[a.agency] ?? { actionCount: 0, totalPenalty: 0 };
+      bucket.actionCount += 1;
+      if (typeof a.penaltyAmount === "number") {
+        bucket.totalPenalty += a.penaltyAmount;
+        totalPenalty += a.penaltyAmount;
+        penalties.push(a.penaltyAmount);
+      }
+      agencyRollup[a.agency] = bucket;
     }
-    agencyRollup[a.agency] = bucket;
-  }
 
-  penalties.sort((a, b) => a - b);
-  const median =
-    penalties.length === 0
-      ? null
-      : penalties[Math.floor(penalties.length / 2)] ?? null;
-  const avg = penalties.length === 0 ? null : totalPenalty / penalties.length;
+    penalties.sort((a, b) => a - b);
+    const median =
+      penalties.length === 0
+        ? null
+        : penalties[Math.floor(penalties.length / 2)] ?? null;
+    const avg = penalties.length === 0 ? null : totalPenalty / penalties.length;
 
-  const agenciesActive = Object.entries(agencyRollup)
-    .map(([agency, v]) => ({
-      agency: agency as Agency,
-      actionCount: v.actionCount,
-      totalPenaltyUsd: Math.round(v.totalPenalty * 100) / 100,
-    }))
-    .sort((a, b) => b.actionCount - a.actionCount);
+    const agenciesActive = Object.entries(agencyRollup)
+      .map(([agency, v]) => ({
+        agency: agency as Agency,
+        actionCount: v.actionCount,
+        totalPenaltyUsd: Math.round(v.totalPenalty * 100) / 100,
+      }))
+      .sort((a, b) => b.actionCount - a.actionCount);
 
-  const metadata = await buildMetadata();
+    const metadata = await safeBuildMetadata();
 
-  return {
-    ok: true,
-    data: {
-      topic,
-      totalMatching: result.total,
-      peerSummary: {
-        agenciesActive,
-        medianPenaltyUsd: median,
-        averagePenaltyUsd: avg,
-        totalPenaltyUsd: Math.round(totalPenalty * 100) / 100,
+    return {
+      ok: true,
+      data: {
+        topic,
+        totalMatching: result.total,
+        peerSummary: {
+          agenciesActive,
+          medianPenaltyUsd: median,
+          averagePenaltyUsd: avg,
+          totalPenaltyUsd: Math.round(totalPenalty * 100) / 100,
+        },
+        actions: result.actions.map(decorateAction),
+        metadata,
       },
-      actions: result.actions.map(decorateAction),
-      metadata,
-    },
-  };
+    };
+  } catch (e) {
+    logger.error({ err: e }, "search_enforcement_by_topic failed; returning schema-safe payload");
+    return {
+      ok: true,
+      data: {
+        topic,
+        totalMatching: 0,
+        peerSummary: {
+          agenciesActive: [],
+          medianPenaltyUsd: null,
+          averagePenaltyUsd: null,
+          totalPenaltyUsd: 0,
+        },
+        actions: [],
+        metadata: fallbackMetadata("query failed"),
+        error: serializeError(
+          err("INTERNAL", e instanceof Error ? e.message : String(e)),
+        ),
+      },
+    };
+  }
 }
 
 export async function handleListActions(
@@ -509,7 +636,7 @@ export async function handleListActions(
       offset,
     });
 
-    const metadata = await buildMetadata();
+    const metadata = await safeBuildMetadata();
     return {
       ok: true,
       data: {
@@ -526,6 +653,9 @@ export async function handleListActions(
         total: 0,
         actions: [],
         metadata: fallbackMetadata("query failed"),
+        error: serializeError(
+          err("INTERNAL", e instanceof Error ? e.message : String(e)),
+        ),
       },
     };
   }
@@ -535,72 +665,144 @@ export async function handleGetAction(
   args: Record<string, unknown>,
 ): Promise<HandlerOutcome<Record<string, unknown>>> {
   const actionId = asString(args.actionId);
-  if (!actionId) return { ok: false, error: err("INVALID_INPUT", "`actionId` is required", "actionId") };
-  const action = await getActionById(actionId);
-  const metadata = await buildMetadata();
-  return {
-    ok: true,
-    data: action
-      ? { found: true, action, metadata }
-      : { found: false, metadata },
-  };
+  if (!actionId) {
+    return {
+      ok: true,
+      data: {
+        found: false,
+        metadata: await safeBuildMetadata(),
+        error: serializeError(err("INVALID_INPUT", "`actionId` is required", "actionId")),
+      },
+    };
+  }
+  try {
+    const action = await getActionById(actionId);
+    const metadata = await safeBuildMetadata();
+    return {
+      ok: true,
+      data: action
+        ? { found: true, action, metadata }
+        : { found: false, metadata },
+    };
+  } catch (e) {
+    logger.error({ err: e }, "get_enforcement_action failed; returning schema-safe payload");
+    return {
+      ok: true,
+      data: {
+        found: false,
+        metadata: fallbackMetadata("query failed"),
+        error: serializeError(
+          err("INTERNAL", e instanceof Error ? e.message : String(e)),
+        ),
+      },
+    };
+  }
 }
 
 export async function handleResolveEntity(
   args: Record<string, unknown>,
 ): Promise<HandlerOutcome<Record<string, unknown>>> {
   const entity = asString(args.entity);
-  if (!entity) return { ok: false, error: err("INVALID_INPUT", "`entity` is required", "entity") };
+  if (!entity) {
+    return {
+      ok: true,
+      data: {
+        query: "",
+        matches: [],
+        metadata: await safeBuildMetadata(),
+        error: serializeError(err("INVALID_INPUT", "`entity` is required", "entity")),
+      },
+    };
+  }
   const limit = clampInt(asNumber(args.limit), 1, 50, 10);
-  const result = await searchActions({ entity, limit, minEntityScore: 0.3 });
-  const matches = formatEntityMatches(result).slice(0, limit);
-  const metadata = await buildMetadata();
-  return { ok: true, data: { query: entity, matches, metadata } };
+  try {
+    const result = await searchActions({ entity, limit, minEntityScore: 0.3 });
+    const matches = formatEntityMatches(result).slice(0, limit);
+    const metadata = await safeBuildMetadata();
+    return { ok: true, data: { query: entity, matches, metadata } };
+  } catch (e) {
+    logger.error({ err: e }, "resolve_entity failed; returning schema-safe payload");
+    return {
+      ok: true,
+      data: {
+        query: entity,
+        matches: [],
+        metadata: fallbackMetadata("query failed"),
+        error: serializeError(
+          err("INTERNAL", e instanceof Error ? e.message : String(e)),
+        ),
+      },
+    };
+  }
 }
 
 export async function handleGetAgencyCoverage(): Promise<HandlerOutcome<Record<string, unknown>>> {
-  const coverage = await getAgencyCoverage();
-  const enriched = await Promise.all(
-    AGENCIES.map(async (agency) => {
-      const row = coverage.find((c) => c.agency === agency) ?? null;
-      const lastRun = await getLastIngestionRun(agency);
-      const totalActions = row?.totalActions ?? 0;
-      const earliestAction = row?.earliestAction ?? null;
-      const latestAction = row?.latestAction ?? null;
-      // Derive an explicit coverageStatus so downstream agents / reviewers
-      // can tell at a glance which agencies are live, partial, or unavailable
-      // — we never silently pretend coverage exists where it doesn't.
-      let coverageStatus: "live" | "partial" | "stale" | "unavailable";
-      let coverageNote: string | null = null;
-      if (totalActions === 0) {
-        coverageStatus = "unavailable";
-        coverageNote =
-          lastRun?.errorMessage
-            ? `No actions ingested. Last ingestion error: ${lastRun.errorMessage}`
-            : "No actions ingested yet. Consult lastIngestedAt / lastIngestStatus for details.";
-      } else if (lastRun?.status === "error") {
-        coverageStatus = "stale";
-        coverageNote = `Latest ingestion failed (${lastRun.errorMessage ?? "unknown error"}); data served is from previous successful run.`;
-      } else if (lastRun?.status === "partial") {
-        coverageStatus = "partial";
-        coverageNote = "Latest ingestion completed partially; some sources did not respond.";
-      } else {
-        coverageStatus = "live";
-      }
-      return {
-        agency,
-        earliestAction,
-        latestAction,
-        totalActions,
-        lastIngestedAt: row?.lastIngestedAt ?? lastRun?.completedAt ?? null,
-        lastIngestStatus: lastRun?.status ?? null,
-        coverageStatus,
-        coverageNote,
-      };
-    }),
-  );
-  const metadata = await buildMetadata();
-  return { ok: true, data: { agencies: enriched, metadata } };
+  try {
+    const coverage = await getAgencyCoverage();
+    const enriched = await Promise.all(
+      AGENCIES.map(async (agency) => {
+        const row = coverage.find((c) => c.agency === agency) ?? null;
+        const lastRun = await getLastIngestionRun(agency);
+        const totalActions = row?.totalActions ?? 0;
+        const earliestAction = row?.earliestAction ?? null;
+        const latestAction = row?.latestAction ?? null;
+        // Derive an explicit coverageStatus so downstream agents / reviewers
+        // can tell at a glance which agencies are live, partial, or unavailable
+        // — we never silently pretend coverage exists where it doesn't.
+        let coverageStatus: "live" | "partial" | "stale" | "unavailable";
+        let coverageNote: string | null = null;
+        if (totalActions === 0) {
+          coverageStatus = "unavailable";
+          coverageNote =
+            lastRun?.errorMessage
+              ? `No actions ingested. Last ingestion error: ${lastRun.errorMessage}`
+              : "No actions ingested yet. Consult lastIngestedAt / lastIngestStatus for details.";
+        } else if (lastRun?.status === "error") {
+          coverageStatus = "stale";
+          coverageNote = `Latest ingestion failed (${lastRun.errorMessage ?? "unknown error"}); data served is from previous successful run.`;
+        } else if (lastRun?.status === "partial") {
+          coverageStatus = "partial";
+          coverageNote = "Latest ingestion completed partially; some sources did not respond.";
+        } else {
+          coverageStatus = "live";
+        }
+        return {
+          agency,
+          earliestAction,
+          latestAction,
+          totalActions,
+          lastIngestedAt: row?.lastIngestedAt ?? lastRun?.completedAt ?? null,
+          lastIngestStatus: lastRun?.status ?? null,
+          coverageStatus,
+          coverageNote,
+        };
+      }),
+    );
+    const metadata = await safeBuildMetadata();
+    return { ok: true, data: { agencies: enriched, metadata } };
+  } catch (e) {
+    logger.error({ err: e }, "get_agency_coverage failed; returning schema-safe payload");
+    const placeholderAgencies = AGENCIES.map((agency) => ({
+      agency,
+      earliestAction: null,
+      latestAction: null,
+      totalActions: 0,
+      lastIngestedAt: null,
+      lastIngestStatus: null,
+      coverageStatus: "unavailable" as const,
+      coverageNote: "Coverage data unavailable due to an internal error.",
+    }));
+    return {
+      ok: true,
+      data: {
+        agencies: placeholderAgencies,
+        metadata: fallbackMetadata("coverage query failed"),
+        error: serializeError(
+          err("INTERNAL", e instanceof Error ? e.message : String(e)),
+        ),
+      },
+    };
+  }
 }
 
 function isoYearsAgo(years: number): string {
